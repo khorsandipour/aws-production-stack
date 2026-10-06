@@ -1,0 +1,147 @@
+name: Emergency Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+      service:
+        description: 'Service to rollback'
+        required: true
+        type: choice
+        options:
+          - all
+          - laravel-backend
+          - nextjs-frontend
+      reason:
+        description: 'Reason for rollback'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: me-south-1
+  ECS_CLUSTER: production-cluster
+
+jobs:
+  rollback:
+    name: Rollback ECS Service
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log rollback initiation
+        run: |
+          echo "================================================"
+          echo "ROLLBACK INITIATED"
+          echo "Environment : ${{ github.event.inputs.environment }}"
+          echo "Service     : ${{ github.event.inputs.service }}"
+          echo "Reason      : ${{ github.event.inputs.reason }}"
+          echo "Initiated by: ${{ github.actor }}"
+          echo "Timestamp   : $(date -u)"
+          echo "================================================"
+
+      - name: Get previous task definition — Backend
+        if: |
+          github.event.inputs.service == 'all' || 
+          github.event.inputs.service == 'laravel-backend'
+        id: prev-backend
+        run: |
+          PREV_ARN=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services laravel-backend \
+            --query 'services[0].deployments[1].taskDefinition' \
+            --output text)
+          echo "Previous backend task definition: $PREV_ARN"
+          echo "task_def=$PREV_ARN" >> $GITHUB_OUTPUT
+
+      - name: Rollback Backend service
+        if: |
+          github.event.inputs.service == 'all' || 
+          github.event.inputs.service == 'laravel-backend'
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service laravel-backend \
+            --task-definition ${{ steps.prev-backend.outputs.task_def }} \
+            --force-new-deployment
+          echo "Backend rollback initiated"
+
+      - name: Get previous task definition — Frontend
+        if: |
+          github.event.inputs.service == 'all' || 
+          github.event.inputs.service == 'nextjs-frontend'
+        id: prev-frontend
+        run: |
+          PREV_ARN=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services nextjs-frontend \
+            --query 'services[0].deployments[1].taskDefinition' \
+            --output text)
+          echo "Previous frontend task definition: $PREV_ARN"
+          echo "task_def=$PREV_ARN" >> $GITHUB_OUTPUT
+
+      - name: Rollback Frontend service
+        if: |
+          github.event.inputs.service == 'all' || 
+          github.event.inputs.service == 'nextjs-frontend'
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service nextjs-frontend \
+            --task-definition ${{ steps.prev-frontend.outputs.task_def }} \
+            --force-new-deployment
+          echo "Frontend rollback initiated"
+
+      - name: Wait for services to stabilize
+        run: |
+          echo "Waiting for rollback to complete..."
+          
+          if [ "${{ github.event.inputs.service }}" == "all" ] || \
+             [ "${{ github.event.inputs.service }}" == "laravel-backend" ]; then
+            aws ecs wait services-stable \
+              --cluster ${{ env.ECS_CLUSTER }} \
+              --services laravel-backend
+            echo "Backend stable after rollback"
+          fi
+          
+          if [ "${{ github.event.inputs.service }}" == "all" ] || \
+             [ "${{ github.event.inputs.service }}" == "nextjs-frontend" ]; then
+            aws ecs wait services-stable \
+              --cluster ${{ env.ECS_CLUSTER }} \
+              --services nextjs-frontend
+            echo "Frontend stable after rollback"
+          fi
+
+      - name: Verify rollback health
+        run: |
+          echo "================================================"
+          echo "ROLLBACK COMPLETE"
+          echo "All specified services returned to"
+          echo "previous stable task definition"
+          echo "Timestamp: $(date -u)"
+          echo "================================================"
+
+      - name: Rollback failed
+        if: failure()
+        run: |
+          echo "================================================"
+          echo "ROLLBACK FAILED"
+          echo "Manual intervention required"
+          echo "Check AWS Console → ECS → ${{ env.ECS_CLUSTER }}"
+          echo "================================================"
